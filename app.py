@@ -12,7 +12,7 @@ from PIL import Image
 
 from src.catalog import furniture_for_space, list_spaces, load_catalog
 from src.costing import USD_TO_INR, CostTracker
-from src.detect_spaces import detect_spaces
+from src.detect_spaces import DetectedSpace, constraints_by_label, detect_spaces
 from src.image_gen import IMAGE_MODEL, clean_floor_plan, furnish_floor_plan
 from src.pdf_utils import image_to_png_bytes, pdf_bytes_to_png
 
@@ -33,7 +33,7 @@ def _init_state() -> None:
         "original_image": None,
         "clean_image": None,
         "final_image": None,
-        "detected_spaces": None,
+        "detected_spaces": None,  # list[DetectedSpace] | None
         "cost_rows": [],
         "show_cost": True,
         "upload_token": None,
@@ -70,6 +70,27 @@ def _get_client() -> OpenAI:
             "OPENAI_API_KEY missing. Copy .env.example to .env and set your key."
         )
     return OpenAI(api_key=api_key)
+
+
+def _as_detected_list(raw: list | None) -> list[DetectedSpace]:
+    """Normalize session state (legacy string list or DetectedSpace dicts)."""
+    if not raw:
+        return []
+    out: list[DetectedSpace] = []
+    for item in raw:
+        if isinstance(item, dict) and item.get("plan_label") and item.get("catalog_space"):
+            entry: DetectedSpace = {
+                "plan_label": str(item["plan_label"]),
+                "catalog_space": str(item["catalog_space"]),
+            }
+            for key in ("doors", "windows", "clearances"):
+                val = item.get(key)
+                if isinstance(val, list) and val:
+                    entry[key] = [str(v) for v in val if str(v).strip()]  # type: ignore[literal-required]
+            out.append(entry)
+        elif isinstance(item, str) and item.strip():
+            out.append({"plan_label": item, "catalog_space": item})
+    return out
 
 
 def _render_cost_panel() -> None:
@@ -110,12 +131,12 @@ def _render_cost_panel() -> None:
 def main() -> None:
     _init_state()
     catalog = load_catalog()
-    all_spaces = list_spaces(catalog)
+    all_catalog_spaces = list_spaces(catalog)
 
     st.title("Personalised Floor Plan Furniture")
     st.caption(
-        "Upload a floor-plan PDF → detect spaces → pick furniture (max 3 per space) "
-        "→ generate one clean 2D furnished plan (no dimensions/labels)."
+        "Upload a floor-plan PDF → detect spaces + clearances → pick furniture "
+        "(max 3 per space) → clean plan (space names + door swings) → furnish."
     )
 
     _render_cost_panel()
@@ -148,7 +169,7 @@ def main() -> None:
     st.subheader("2. Detect spaces")
     col_d1, col_d2 = st.columns([1, 3])
     with col_d1:
-        detect_clicked = st.button("Detect spaces (GPT-4o)", type="primary")
+        detect_clicked = st.button("Detect spaces", type="primary")
     with col_d2:
         st.session_state.skip_detection = st.checkbox(
             "Skip detection — show all catalog spaces (offline UI check)",
@@ -157,7 +178,7 @@ def main() -> None:
 
     if detect_clicked:
         try:
-            with st.spinner("Detecting spaces with GPT-4o…"):
+            with st.spinner("Detecting spaces + clearances"):
                 client = _get_client()
                 tracker = _tracker()
                 spaces = detect_spaces(
@@ -174,44 +195,68 @@ def main() -> None:
                         "No catalog spaces matched. Try another PDF or use all spaces."
                     )
                 else:
-                    st.success(f"Detected: {', '.join(spaces)}")
+                    shown = ", ".join(
+                        f"{s['plan_label']} → {s['catalog_space']}" for s in spaces
+                    )
+                    st.success(f"Detected: {shown}")
         except Exception as exc:
             st.exception(exc)
 
-    if st.session_state.skip_detection or st.session_state.detected_spaces is None:
-        available_spaces = all_spaces
-        if st.session_state.detected_spaces is None and not st.session_state.skip_detection:
+    detected = _as_detected_list(st.session_state.detected_spaces)
+    room_constraints = constraints_by_label(detected)
+
+    # plan_label → catalog_space for furniture lookup
+    label_to_catalog: dict[str, str] = {}
+    if st.session_state.skip_detection or not detected:
+        available_labels = all_catalog_spaces
+        for name in all_catalog_spaces:
+            label_to_catalog[name] = name
+        if not detected and not st.session_state.skip_detection:
             st.caption("Run detection, or keep skip enabled to use the full catalog.")
     else:
-        available_spaces = [
-            s for s in st.session_state.detected_spaces if s in all_spaces
-        ] or all_spaces
+        available_labels = []
+        for item in detected:
+            label = item["plan_label"]
+            cat = item["catalog_space"]
+            if cat not in all_catalog_spaces:
+                continue
+            if label not in label_to_catalog:
+                available_labels.append(label)
+                label_to_catalog[label] = cat
+        if not available_labels:
+            available_labels = all_catalog_spaces
+            for name in all_catalog_spaces:
+                label_to_catalog[name] = name
 
     st.subheader("3. Configure furniture (multiple spaces)")
-    detected = st.session_state.detected_spaces or []
-    default_spaces = [s for s in detected if s in available_spaces][:4]
+    default_labels = [lbl for lbl in available_labels if lbl in label_to_catalog][:4]
+    if detected and not st.session_state.skip_detection:
+        default_labels = [
+            d["plan_label"] for d in detected if d["plan_label"] in available_labels
+        ][:4]
 
-    selected_spaces = st.multiselect(
+    selected_labels = st.multiselect(
         "Spaces to furnish",
-        options=available_spaces,
-        default=default_spaces,
-        help="Only spaces available on the plan / catalog are listed.",
+        options=available_labels,
+        default=default_labels,
+        help="Names match the floor-plan labels when detection is used.",
     )
 
     selections: dict[str, list[str]] = {}
-    for space in selected_spaces:
-        options = furniture_for_space(space, catalog)
+    for plan_label in selected_labels:
+        catalog_space = label_to_catalog.get(plan_label, plan_label)
+        options = furniture_for_space(catalog_space, catalog)
         prior = [
-            c for c in st.session_state.selections.get(space, []) if c in options
+            c for c in st.session_state.selections.get(plan_label, []) if c in options
         ][:MAX_FURNITURE]
         picked = st.multiselect(
-            f"Furniture for **{space}** (max {MAX_FURNITURE})",
+            f"Furniture for **{plan_label}** (max {MAX_FURNITURE})",
             options=options,
             default=prior,
-            key=f"furn_{space}",
+            key=f"furn_{plan_label}",
             max_selections=MAX_FURNITURE,
         )
-        selections[space] = list(picked)[:MAX_FURNITURE]
+        selections[plan_label] = list(picked)[:MAX_FURNITURE]
 
     st.session_state.selections = selections
 
@@ -222,8 +267,8 @@ def main() -> None:
         type="primary",
         disabled=not ready,
         help=(
-            "Runs gpt-image-2: wipe furniture/labels, then place all selections "
-            "in one final image."
+            "Runs gpt-image-2: clean (space names + door swings), then place "
+            "furniture using clearance notes from detection when available."
         ),
     )
 
@@ -231,15 +276,20 @@ def main() -> None:
         try:
             client = _get_client()
             tracker = _tracker()
-            with st.spinner("Step A — cleaning floor plan (gpt-image-2)…"):
+            active = {k: v for k, v in selections.items() if v}
+            furnish_constraints = {
+                k: room_constraints[k] for k in active if k in room_constraints
+            } or None
+            with st.spinner("Step A — cleaning floor plan"):
                 clean = clean_floor_plan(original, client=client, cost_tracker=tracker)
                 st.session_state.clean_image = clean
-            with st.spinner("Step B — placing furniture (gpt-image-2)…"):
+            with st.spinner("Step B — placing furniture"):
                 final = furnish_floor_plan(
                     clean,
-                    {k: v for k, v in selections.items() if v},
+                    active,
                     client=client,
                     cost_tracker=tracker,
+                    constraints=furnish_constraints,
                 )
                 st.session_state.final_image = final
             _persist_tracker(tracker)
@@ -256,7 +306,7 @@ def main() -> None:
             st.markdown("**Original**")
             st.image(original, use_container_width=True)
         with cols[1]:
-            st.markdown("**Clean (no furniture / labels)**")
+            st.markdown("**Clean (space names + door swings)**")
             if clean_img is not None:
                 st.image(clean_img, use_container_width=True)
                 st.download_button(
@@ -283,10 +333,16 @@ def main() -> None:
                 st.caption("Not generated yet.")
 
     with st.expander("Selection summary"):
-        st.json(
-            {k: v for k, v in selections.items() if v}
-            or {"note": "No furniture selected"}
-        )
+        summary = {
+            plan_label: {
+                "catalog_space": label_to_catalog.get(plan_label, plan_label),
+                "furniture": items,
+                "clearances": room_constraints.get(plan_label),
+            }
+            for plan_label, items in selections.items()
+            if items
+        }
+        st.json(summary or {"note": "No furniture selected"})
 
 
 if __name__ == "__main__":
