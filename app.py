@@ -13,7 +13,7 @@ from PIL import Image
 from src.catalog import furniture_for_space, list_spaces, load_catalog
 from src.costing import USD_TO_INR, CostTracker
 from src.detect_spaces import DetectedSpace, constraints_by_label, detect_spaces
-from src.image_gen import IMAGE_MODEL, clean_floor_plan, furnish_floor_plan
+from src.image_gen import IMAGE_MODEL, clean_floor_plan, furnish_floor_plan, refine_furnished_plan
 from src.pdf_utils import image_to_png_bytes, pdf_bytes_to_png
 
 ROOT = Path(__file__).resolve().parent
@@ -33,6 +33,7 @@ def _init_state() -> None:
         "original_image": None,
         "clean_image": None,
         "final_image": None,
+        "refined_image": None,
         "detected_spaces": None,  # list[DetectedSpace] | None
         "cost_rows": [],
         "show_cost": True,
@@ -49,6 +50,7 @@ def _reset_run_state() -> None:
     st.session_state.original_image = None
     st.session_state.clean_image = None
     st.session_state.final_image = None
+    st.session_state.refined_image = None
     st.session_state.detected_spaces = None
     st.session_state.cost_rows = []
     st.session_state.selections = {}
@@ -292,6 +294,7 @@ def main() -> None:
                     constraints=furnish_constraints,
                 )
                 st.session_state.final_image = final
+                st.session_state.refined_image = None
             _persist_tracker(tracker)
             st.success("Generation complete.")
         except Exception as exc:
@@ -331,6 +334,50 @@ def main() -> None:
                 )
             else:
                 st.caption("Not generated yet.")
+
+        if final_img is not None:
+            st.subheader("6. Refine furnished plan")
+            refine_prompt = st.text_area(
+                "Describe changes to the final furnished plan",
+                placeholder=(
+                    "e.g. move the sofa to the opposite wall, add a round dining table"
+                ),
+                key="refine_prompt",
+            )
+            apply_refine = st.button(
+                "Apply changes",
+                type="primary",
+                disabled=not refine_prompt.strip(),
+                key="apply_refine",
+            )
+            if apply_refine and refine_prompt.strip():
+                try:
+                    client = _get_client()
+                    tracker = _tracker()
+                    with st.spinner("Applying your changes to the furnished plan"):
+                        refined = refine_furnished_plan(
+                            final_img,
+                            refine_prompt,
+                            client=client,
+                            cost_tracker=tracker,
+                        )
+                    st.session_state.refined_image = refined
+                    _persist_tracker(tracker)
+                    st.success("Refined plan generated.")
+                except Exception as exc:
+                    st.exception(exc)
+
+            refined_img = st.session_state.refined_image
+            if refined_img is not None:
+                st.markdown("**Refined furnished**")
+                st.image(refined_img, use_container_width=True)
+                st.download_button(
+                    "Download refined PNG",
+                    data=image_to_png_bytes(refined_img),
+                    file_name="refined_furnished_floor_plan.png",
+                    mime="image/png",
+                    key="dl_refined",
+                )
 
     with st.expander("Selection summary"):
         summary = {

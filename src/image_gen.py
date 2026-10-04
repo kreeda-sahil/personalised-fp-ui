@@ -52,6 +52,7 @@ def _edit_image(
     prompt: str,
     *,
     model: str = IMAGE_MODEL,
+    input_fidelity: str | None = "high",
 ) -> Image.Image:
     file_obj = _to_png_file(image)
     kwargs: dict[str, Any] = {
@@ -60,8 +61,9 @@ def _edit_image(
         "prompt": prompt,
         "n": 1,
         "size": "1024x1024",
-        "input_fidelity": "high",
     }
+    if input_fidelity:
+        kwargs["input_fidelity"] = input_fidelity
     try:
         response = client.images.edit(**kwargs)
     except Exception as first_err:
@@ -93,6 +95,11 @@ def clean_floor_plan(
     prompt = (
         "Edit this architectural floor plan into a CLEAN 2D top-down line drawing. "
         "Rules are GLOBAL and must work for any residential floor-plan PDF.\n\n"
+        "NO INVENTION (never violate):\n"
+        "- Do not add walls, rooms, doors, windows, openings, fixtures, furniture, or "
+        "labels that are not already on the uploaded plan.\n"
+        "- Do not complete, symmetrize, straighten, or restyle the architecture.\n"
+        "- Do not invent new geometry. If it is not on the source, it must not appear.\n\n"
         "KEEP (structure):\n"
         "- Walls, columns, windows, openings — exact geometry; do not erase, move, "
         "thin, open, break, or merge walls.\n"
@@ -115,9 +122,9 @@ def clean_floor_plan(
         "- Dimension strings, measurement numbers, arrows, and non-space callouts.\n\n"
         "Output: empty rooms with walls/doors/swings/windows + space names only. "
         "No furniture geometry. No object labels. No dimensions. "
-        "White/light background, dark walls."
+        "Nothing that was not on the uploaded plan. White/light background, dark walls."
     )
-    result = _edit_image(client, image, prompt, model=model)
+    result = _edit_image(client, image, prompt, model=model, input_fidelity="high")
     if cost_tracker is not None:
         cost_tracker.add_image(
             label="Clean floor plan (space names + door swings; no furniture)",
@@ -203,11 +210,14 @@ def furnish_floor_plan(
         "blocks the clear path from any door into the room.\n"
         "- Prefer walls that are free of doors for large pieces (beds, wardrobes, sofas, "
         "storage). If a wall has a door, leave the swing and approach clear.\n"
-        "- Prefer not to block windows with tall storage when another free wall exists.\n"
+        "- TALL furniture (wardrobes, TV units, storage, beds, bookcases, dressers) must "
+        "NOT sit against or cover windows. Use a free wall instead.\n"
+        "- SMALL / LOW furniture (side tables, stools, chairs) MAY sit against a window "
+        "wall if they do not block the window opening.\n"
         "- Use correct 2D plan symbols and true shapes (e.g. L-shaped sofa must look L-shaped).\n"
-        "- Scale furniture to the room: not oversized, not tiny; clear circulation; "
+        "- Scale each piece to the room: not oversized, not tiny; leave clear circulation; "
         "no overlapping pieces.\n"
-        "- Beds: head against a wall that is NOT in a door swing path.\n"
+        "- Beds: head against a wall that is NOT in a door swing path and NOT a window wall.\n"
         "- Sofas/TV units/wardrobes/storage: against walls, not floating in circulation.\n"
         "- Do NOT add furniture that was not listed.\n\n"
         "FURNITURE LOOK (furniture only — do not restyle the plan):\n"
@@ -218,16 +228,65 @@ def furnish_floor_plan(
         "- Wardrobes/storage: flat modern fills (white or light grey) with thin outlines.\n"
         "- Do NOT use dark wood, heavy grain, bold fabric prints, or busy patterns.\n"
         "- Walls, columns, doors, door swing arcs, windows, openings, and space labels must stay "
-        "as black/white line drawing — change furniture appearance only; do not move or resize "
-        "furniture beyond the placement rules above.\n"
+        "as black/white line drawing.\n"
         "- Output one complete furnished 2D floor plan image."
     )
-    result = _edit_image(client, clean_image, prompt, model=model)
+    result = _edit_image(
+        client, clean_image, prompt, model=model, input_fidelity="high"
+    )
     if cost_tracker is not None:
         cost_tracker.add_image(
             label="Furnish floor plan (all selections)",
             model=model,
             images=1,
             details="gpt-image-2 edit — place selected furniture",
+        )
+    return result
+
+
+def refine_furnished_plan(
+    furnished_image: Image.Image,
+    user_prompt: str,
+    *,
+    client: OpenAI | None = None,
+    model: str = IMAGE_MODEL,
+    cost_tracker: CostTracker | None = None,
+) -> Image.Image:
+    """Apply a user prompt to an already furnished 2D floor plan."""
+    client = client or OpenAI()
+    instruction = user_prompt.strip()
+    prompt = (
+        "You are given an already FURNISHED 2D architectural floor plan (top-down).\n\n"
+        "PRIMARY TASK — the output is WRONG if this is not visibly done:\n"
+        f'"{instruction}"\n\n'
+        "You MUST follow that instruction strictly.\n"
+        "- If the user asks to swap or move furniture, relocate those pieces. Their old "
+        "positions must be empty of those pieces. Do not leave them where they started.\n"
+        "- If the user asks for a piece to be stuck / flush / against a wall, draw it "
+        "tight to that wall (not floating).\n"
+        "- A copy of the input with the same furniture layout is a failed result.\n\n"
+        "STRUCTURE LOCK (walls only — never violate):\n"
+        "- Copy walls, columns, doors, door swing arcs, windows, and openings EXACTLY.\n"
+        "- Do not erase, move, thin, open, break, or merge walls/rooms.\n"
+        "- Keep every existing space name label; do not add dimensions or measurements.\n"
+        "- Walls, columns, doors, door swing arcs, windows, openings, and space labels "
+        "must stay as black/white line drawing.\n"
+        "- Leave other rooms and unmentioned furniture unchanged.\n\n"
+        "AFTER MOVING, still obey openings:\n"
+        "- Never place furniture inside a door swing arc or blocking a door path.\n"
+        "- Tall furniture (wardrobes, TV units, storage, beds, bookcases) must not sit "
+        "against or cover windows.\n"
+        "- Small/low furniture may sit against a window wall if it does not block the opening.\n"
+        "- Output one complete furnished 2D floor plan image with the requested layout change."
+    )
+    result = _edit_image(
+        client, furnished_image, prompt, model=model, input_fidelity="low"
+    )
+    if cost_tracker is not None:
+        cost_tracker.add_image(
+            label="Refine furnished plan from user prompt",
+            model=model,
+            images=1,
+            details="gpt-image-2 edit — user prompt on furnished plan",
         )
     return result
